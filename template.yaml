@@ -387,26 +387,52 @@ Resources:
       LogGroupName: !Sub '/aws/lambda/${FunctionName}'
       RetentionInDays: 7
 
-  # EventBridge Rule for hourly execution
-  WorkspaceTagSyncScheduleRule:
-    Type: AWS::Events::Rule
+  # EventBridge Scheduler Role
+  WorkspaceTagSyncSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${FunctionName}-scheduler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt WorkspaceTagSyncFunction.Arn
+
+  # EventBridge Schedule for hourly execution
+  WorkspaceTagSyncSchedule:
+    Type: AWS::Scheduler::Schedule
     Properties:
       Name: !Sub '${FunctionName}-schedule'
       Description: Triggers WorkSpace tag sync Lambda function hourly
       ScheduleExpression: !Ref ScheduleExpression
+      FlexibleTimeWindow:
+        Mode: 'OFF'
       State: ENABLED
-      Targets:
-        - Arn: !GetAtt WorkspaceTagSyncFunction.Arn
-          Id: WorkspaceTagSyncTarget
+      Target:
+        Arn: !GetAtt WorkspaceTagSyncFunction.Arn
+        RoleArn: !GetAtt WorkspaceTagSyncSchedulerRole.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 2
 
-  # Permission for EventBridge to invoke Lambda
+  # Permission for EventBridge Scheduler to invoke Lambda
   WorkspaceTagSyncInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref WorkspaceTagSyncFunction
       Action: lambda:InvokeFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt WorkspaceTagSyncScheduleRule.Arn
+      Principal: scheduler.amazonaws.com
+      SourceArn: !Sub 'arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${FunctionName}-schedule'
 
   # CloudWatch Alarm for Lambda errors
   WorkspaceTagSyncErrorAlarm:
@@ -446,10 +472,16 @@ Outputs:
       Name: !Sub '${AWS::StackName}-RoleArn'
 
   ScheduleRuleName:
-    Description: EventBridge schedule rule name
-    Value: !Ref WorkspaceTagSyncScheduleRule
+    Description: EventBridge schedule name
+    Value: !Ref WorkspaceTagSyncSchedule
     Export:
-      Name: !Sub '${AWS::StackName}-ScheduleRule'
+      Name: !Sub '${AWS::StackName}-Schedule'
+
+  ScheduleRoleArn:
+    Description: EventBridge Scheduler role ARN
+    Value: !GetAtt WorkspaceTagSyncSchedulerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SchedulerRole'
 
   LogGroupName:
     Description: CloudWatch log group name

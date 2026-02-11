@@ -41,9 +41,9 @@ chmod +x deploy-cfn.sh delete-cfn.sh
 ```
 
 This will:
-1. Create IAM role with necessary permissions
+1. Create IAM roles with necessary permissions
 2. Deploy Lambda function with inline code
-3. Set up hourly EventBridge schedule
+3. Set up hourly EventBridge schedule (modern scheduler)
 4. Create CloudWatch log group and alarm
 5. Configure all permissions automatically
 
@@ -130,7 +130,7 @@ Default settings (configurable in template.yaml):
 
 ## Scheduling
 
-The CloudFormation template automatically creates an EventBridge rule to run the function every hour. You can customize the schedule by modifying the `ScheduleExpression` parameter in `template.yaml`.
+The CloudFormation template automatically creates an EventBridge Schedule to run the function every hour. You can customize the schedule by modifying the `ScheduleExpression` parameter in `template.yaml`.
 
 Supported schedule expressions:
 - `rate(1 hour)` - Every hour (default)
@@ -143,6 +143,10 @@ To change the schedule, edit `template.yaml` and redeploy:
 ```bash
 ./deploy-cfn.sh workspace-tag-sync-stack us-east-1
 ```
+
+The schedule includes:
+- Automatic retry on failure (up to 2 retries)
+- Dedicated IAM role for scheduler execution
 
 ## Troubleshooting
 
@@ -169,8 +173,8 @@ Remove all deployed resources:
 
 This will delete the entire CloudFormation stack including:
 - Lambda function
-- IAM role and policy
-- EventBridge rule
+- IAM roles and policies
+- EventBridge schedule
 - CloudWatch log group and alarm
 
 ## Cost Considerations
