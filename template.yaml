@@ -1,0 +1,458 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'WorkSpace Tag Sync Lambda - Syncs tags from WorkSpaces to Fleet Manager instances'
+
+Parameters:
+  FunctionName:
+    Type: String
+    Default: workspace-tag-sync
+    Description: Name of the Lambda function
+  
+  ScheduleExpression:
+    Type: String
+    Default: rate(1 hour)
+    Description: Schedule expression for Lambda execution (e.g., rate(1 hour), cron(0 * * * ? *))
+  
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    Description: Lambda function timeout in seconds
+    MinValue: 60
+    MaxValue: 900
+  
+  LambdaMemory:
+    Type: Number
+    Default: 256
+    Description: Lambda function memory in MB
+    AllowedValues: [128, 256, 512, 1024, 2048, 3008]
+
+Resources:
+  # Lambda Execution Role
+  WorkspaceTagSyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${FunctionName}-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WorkspaceTagSyncPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - workspaces:DescribeWorkspaces
+                  - workspaces:DescribeTags
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:DescribeInstanceInformation
+                  - ssm:AddTagsToResource
+                  - ssm:ListTagsForResource
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${FunctionName}*'
+
+  # Lambda Function
+  WorkspaceTagSyncFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt WorkspaceTagSyncRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemory
+      Description: Syncs tags from WorkSpaces to associated Fleet Manager instances
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          from typing import Dict, List, Optional
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize AWS clients
+          workspaces_client = boto3.client('workspaces')
+          ssm_client = boto3.client('ssm')
+
+
+          def get_all_workspaces() -> List[Dict]:
+              """Retrieve all WorkSpaces in the account."""
+              workspaces = []
+              next_token = None
+              
+              try:
+                  while True:
+                      if next_token:
+                          response = workspaces_client.describe_workspaces(NextToken=next_token)
+                      else:
+                          response = workspaces_client.describe_workspaces()
+                      
+                      workspaces.extend(response.get('Workspaces', []))
+                      next_token = response.get('NextToken')
+                      
+                      if not next_token:
+                          break
+                          
+                  logger.info(f"Found {len(workspaces)} WorkSpaces")
+                  return workspaces
+              except Exception as e:
+                  logger.error(f"Error retrieving WorkSpaces: {str(e)}")
+                  raise
+
+
+          def get_workspace_tags(workspace_id: str) -> List[Dict]:
+              """Get tags for a specific WorkSpace."""
+              try:
+                  response = workspaces_client.describe_tags(ResourceId=workspace_id)
+                  tags = response.get('TagList', [])
+                  logger.info(f"Retrieved {len(tags)} tags for WorkSpace {workspace_id}")
+                  return tags
+              except Exception as e:
+                  logger.error(f"Error retrieving tags for WorkSpace {workspace_id}: {str(e)}")
+                  return []
+
+
+          def get_fleet_manager_instance_id(workspace: Dict) -> Optional[str]:
+              """
+              Get the Fleet Manager (SSM) instance ID associated with a WorkSpace.
+              Tries multiple matching strategies to find the instance.
+              """
+              try:
+                  workspace_id = workspace.get('WorkspaceId')
+                  computer_name = workspace.get('ComputerName')
+                  
+                  logger.info(f"Looking for instance - WorkspaceId: {workspace_id}, ComputerName: {computer_name}")
+                  
+                  # Strategy 1: Match by WorkspaceId tag
+                  try:
+                      response = ssm_client.describe_instance_information(
+                          Filters=[
+                              {
+                                  'Key': 'tag:WorkspaceId',
+                                  'Values': [workspace_id]
+                              }
+                          ]
+                      )
+                      
+                      instances = response.get('InstanceInformationList', [])
+                      if instances:
+                          instance_id = instances[0].get('InstanceId')
+                          logger.info(f"Found instance {instance_id} by WorkspaceId tag for {workspace_id}")
+                          return instance_id
+                  except Exception as e:
+                      logger.debug(f"WorkspaceId tag search failed: {str(e)}")
+                  
+                  # Strategy 2: Get all SSM instances and match by ComputerName (case-insensitive)
+                  if computer_name:
+                      try:
+                          next_token = None
+                          while True:
+                              if next_token:
+                                  response = ssm_client.describe_instance_information(NextToken=next_token)
+                              else:
+                                  response = ssm_client.describe_instance_information()
+                              
+                              for instance in response.get('InstanceInformationList', []):
+                                  instance_computer_name = instance.get('ComputerName', '')
+                                  instance_id = instance.get('InstanceId')
+                                  
+                                  # Case-insensitive comparison
+                                  if instance_computer_name.lower() == computer_name.lower():
+                                      logger.info(f"Found instance {instance_id} by ComputerName match for {workspace_id}")
+                                      return instance_id
+                                  
+                                  # Try partial match (ComputerName might be truncated or have prefix/suffix)
+                                  if computer_name.lower() in instance_computer_name.lower() or instance_computer_name.lower() in computer_name.lower():
+                                      logger.info(f"Found instance {instance_id} by partial ComputerName match for {workspace_id}")
+                                      return instance_id
+                              
+                              next_token = response.get('NextToken')
+                              if not next_token:
+                                  break
+                      except Exception as e:
+                          logger.debug(f"ComputerName search failed: {str(e)}")
+                  
+                  # Strategy 3: Match by workspace-id in instance name/tags
+                  try:
+                      response = ssm_client.describe_instance_information()
+                      for instance in response.get('InstanceInformationList', []):
+                          instance_id = instance.get('InstanceId')
+                          instance_name = instance.get('Name', '')
+                          
+                          # Check if workspace_id appears in instance name
+                          if workspace_id.lower() in instance_name.lower():
+                              logger.info(f"Found instance {instance_id} by Name containing WorkspaceId for {workspace_id}")
+                              return instance_id
+                  except Exception as e:
+                      logger.debug(f"Instance name search failed: {str(e)}")
+                  
+                  logger.warning(f"No Fleet Manager instance found for WorkSpace {workspace_id} (ComputerName: {computer_name})")
+                  return None
+                  
+              except Exception as e:
+                  logger.error(f"Error finding Fleet Manager instance for WorkSpace {workspace.get('WorkspaceId')}: {str(e)}")
+                  return None
+
+
+          def get_instance_tags(instance_id: str) -> tuple[Dict[str, str], bool]:
+              """
+              Get existing tags for a Fleet Manager instance.
+              Returns: (tag_dict, success)
+              """
+              try:
+                  response = ssm_client.list_tags_for_resource(
+                      ResourceType='ManagedInstance',
+                      ResourceId=instance_id
+                  )
+                  
+                  tags = response.get('TagList', [])
+                  # Convert to dict for easy comparison
+                  tag_dict = {tag['Key']: tag['Value'] for tag in tags}
+                  logger.info(f"Retrieved {len(tags)} existing tags for instance {instance_id}")
+                  return tag_dict, True
+              except Exception as e:
+                  logger.error(f"Error retrieving tags for instance {instance_id}: {str(e)}")
+                  return {}, False
+
+
+          def apply_tags_to_instance(instance_id: str, tags: List[Dict]) -> tuple[bool, str]:
+              """
+              Apply tags to a Fleet Manager instance only if they differ from existing tags.
+              Returns: (success, status_message)
+              """
+              if not tags:
+                  logger.info(f"No tags to apply to instance {instance_id}")
+                  return True, "no_tags"
+              
+              try:
+                  # Get existing tags
+                  existing_tags, can_read_tags = get_instance_tags(instance_id)
+                  
+                  if not can_read_tags:
+                      # If we can't read tags, we'll apply them anyway (might be redundant)
+                      logger.warning(f"Cannot read existing tags for {instance_id}, applying all tags")
+                      ssm_tags = [{'Key': tag['Key'], 'Value': tag['Value']} for tag in tags]
+                      
+                      ssm_client.add_tags_to_resource(
+                          ResourceType='ManagedInstance',
+                          ResourceId=instance_id,
+                          Tags=ssm_tags
+                      )
+                      
+                      logger.info(f"Applied {len(ssm_tags)} tags to instance {instance_id} (could not verify existing tags)")
+                      return True, "applied_without_verification"
+                  
+                  # Convert workspace tags to dict for comparison
+                  new_tags_dict = {tag['Key']: tag['Value'] for tag in tags}
+                  
+                  # Find tags that need to be added or updated
+                  tags_to_apply = []
+                  for key, value in new_tags_dict.items():
+                      if key not in existing_tags or existing_tags[key] != value:
+                          tags_to_apply.append({'Key': key, 'Value': value})
+                  
+                  if not tags_to_apply:
+                      logger.info(f"All {len(tags)} tags already match for instance {instance_id}, skipping update")
+                      return True, "skipped_matching"
+                  
+                  # Apply only the tags that differ
+                  ssm_client.add_tags_to_resource(
+                      ResourceType='ManagedInstance',
+                      ResourceId=instance_id,
+                      Tags=tags_to_apply
+                  )
+                  
+                  logger.info(f"Successfully applied {len(tags_to_apply)} new/updated tags to instance {instance_id} (skipped {len(tags) - len(tags_to_apply)} matching tags)")
+                  return True, f"updated_{len(tags_to_apply)}_tags"
+              except Exception as e:
+                  logger.error(f"Error applying tags to instance {instance_id}: {str(e)}")
+                  return False, f"error: {str(e)}"
+
+
+          def lambda_handler(event, context):
+              """
+              Main Lambda handler function.
+              Pulls tags from all WorkSpaces and applies them to associated Fleet Manager instances.
+              """
+              logger.info("Starting WorkSpace tag synchronization")
+              
+              results = {
+                  'total_workspaces': 0,
+                  'successful': 0,
+                  'skipped': 0,
+                  'failed': 0,
+                  'no_instance_found': 0,
+                  'details': []
+              }
+              
+              try:
+                  # Get all WorkSpaces
+                  workspaces = get_all_workspaces()
+                  results['total_workspaces'] = len(workspaces)
+                  
+                  # Process each WorkSpace
+                  for workspace in workspaces:
+                      workspace_id = workspace.get('WorkspaceId')
+                      
+                      try:
+                          # Get WorkSpace tags
+                          tags = get_workspace_tags(workspace_id)
+                          
+                          # Find associated Fleet Manager instance
+                          instance_id = get_fleet_manager_instance_id(workspace)
+                          
+                          if not instance_id:
+                              results['no_instance_found'] += 1
+                              results['details'].append({
+                                  'workspace_id': workspace_id,
+                                  'status': 'no_instance_found'
+                              })
+                              continue
+                          
+                          # Apply tags to instance
+                          success, status_msg = apply_tags_to_instance(instance_id, tags)
+                          
+                          if success:
+                              if status_msg == "skipped_matching":
+                                  results['skipped'] += 1
+                                  results['details'].append({
+                                      'workspace_id': workspace_id,
+                                      'instance_id': instance_id,
+                                      'tags_checked': len(tags),
+                                      'status': 'skipped_matching'
+                                  })
+                              else:
+                                  results['successful'] += 1
+                                  results['details'].append({
+                                      'workspace_id': workspace_id,
+                                      'instance_id': instance_id,
+                                      'tags_applied': len(tags),
+                                      'status': status_msg
+                                  })
+                          else:
+                              results['failed'] += 1
+                              results['details'].append({
+                                  'workspace_id': workspace_id,
+                                  'instance_id': instance_id,
+                                  'status': 'failed',
+                                  'error': status_msg
+                              })
+                              
+                      except Exception as e:
+                          logger.error(f"Error processing WorkSpace {workspace_id}: {str(e)}")
+                          results['failed'] += 1
+                          results['details'].append({
+                              'workspace_id': workspace_id,
+                              'status': 'error',
+                              'error': str(e)
+                          })
+                  
+                  logger.info(f"Synchronization complete: {results['successful']} successful, {results['skipped']} skipped (matching), {results['failed']} failed, {results['no_instance_found']} no instance found")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(results)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Fatal error in lambda_handler: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'results': results
+                      })
+                  }
+
+  # CloudWatch Log Group
+  WorkspaceTagSyncLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${FunctionName}'
+      RetentionInDays: 7
+
+  # EventBridge Rule for hourly execution
+  WorkspaceTagSyncScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${FunctionName}-schedule'
+      Description: Triggers WorkSpace tag sync Lambda function hourly
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt WorkspaceTagSyncFunction.Arn
+          Id: WorkspaceTagSyncTarget
+
+  # Permission for EventBridge to invoke Lambda
+  WorkspaceTagSyncInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WorkspaceTagSyncFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WorkspaceTagSyncScheduleRule.Arn
+
+  # CloudWatch Alarm for Lambda errors
+  WorkspaceTagSyncErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${FunctionName}-errors'
+      AlarmDescription: Alert when Lambda function encounters errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FunctionName
+      TreatMissingData: notBreaching
+
+Outputs:
+  FunctionName:
+    Description: Lambda function name
+    Value: !Ref WorkspaceTagSyncFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionName'
+
+  FunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt WorkspaceTagSyncFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionArn'
+
+  RoleArn:
+    Description: IAM role ARN
+    Value: !GetAtt WorkspaceTagSyncRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RoleArn'
+
+  ScheduleRuleName:
+    Description: EventBridge schedule rule name
+    Value: !Ref WorkspaceTagSyncScheduleRule
+    Export:
+      Name: !Sub '${AWS::StackName}-ScheduleRule'
+
+  LogGroupName:
+    Description: CloudWatch log group name
+    Value: !Ref WorkspaceTagSyncLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
