@@ -158,7 +158,7 @@ Resources:
                   except Exception as e:
                       logger.debug(f"WorkspaceId tag search failed: {str(e)}")
                   
-                  # Strategy 2: Get all SSM instances and match by ComputerName (case-insensitive)
+                  # Strategy 2: Get all SSM instances and match by ComputerName (case-insensitive exact match)
                   if computer_name:
                       try:
                           next_token = None
@@ -172,14 +172,9 @@ Resources:
                                   instance_computer_name = instance.get('ComputerName', '')
                                   instance_id = instance.get('InstanceId')
                                   
-                                  # Case-insensitive comparison
+                                  # Case-insensitive exact match only
                                   if instance_computer_name.lower() == computer_name.lower():
-                                      logger.info(f"Found instance {instance_id} by ComputerName match for {workspace_id}")
-                                      return instance_id
-                                  
-                                  # Try partial match (ComputerName might be truncated or have prefix/suffix)
-                                  if computer_name.lower() in instance_computer_name.lower() or instance_computer_name.lower() in computer_name.lower():
-                                      logger.info(f"Found instance {instance_id} by partial ComputerName match for {workspace_id}")
+                                      logger.info(f"Found instance {instance_id} by exact ComputerName match for {workspace_id}")
                                       return instance_id
                               
                               next_token = response.get('NextToken')
