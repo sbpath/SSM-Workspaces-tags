@@ -172,9 +172,13 @@ Resources:
                                   instance_computer_name = instance.get('ComputerName', '')
                                   instance_id = instance.get('InstanceId')
                                   
-                                  # Case-insensitive exact match only
-                                  if instance_computer_name.lower() == computer_name.lower():
-                                      logger.info(f"Found instance {instance_id} by exact ComputerName match for {workspace_id}")
+                                  # Extract hostname from FQDN if present (e.g., HOSTNAME.domain.com -> HOSTNAME)
+                                  instance_hostname = instance_computer_name.split('.')[0] if '.' in instance_computer_name else instance_computer_name
+                                  workspace_hostname = computer_name.split('.')[0] if '.' in computer_name else computer_name
+                                  
+                                  # Case-insensitive exact match on hostname (without domain)
+                                  if instance_hostname.lower() == workspace_hostname.lower():
+                                      logger.info(f"Found instance {instance_id} by hostname match (WorkSpace: {computer_name}, Instance: {instance_computer_name}) for {workspace_id}")
                                       return instance_id
                               
                               next_token = response.get('NextToken')
